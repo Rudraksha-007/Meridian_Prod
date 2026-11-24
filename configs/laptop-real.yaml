@@ -1,0 +1,11 @@
+listen_host: 127.0.0.1
+resource_policy: protect-llm
+
+# 16 GB laptop: keep ~2 GB for the desktop and the rest of the OS.
+resources:
+  ram_headroom_mb: 2048
+  vram_headroom_mb: 0
+  protected_llm_vram_mb: 0
+  gpu_probe: off
+
+shutdown_grace_seconds: 10

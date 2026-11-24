@@ -1,0 +1,387 @@
+package balancer
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/dikshaWagh/meridian/internal/api"
+	"github.com/dikshaWagh/meridian/internal/metrics"
+	"github.com/dikshaWagh/meridian/internal/tokens"
+)
+
+type requestUsage struct {
+	in, out      int
+	ok           bool
+	assistantMsg *api.Message
+	streamed     bool      // reply was streamed (server-sent events)
+	firstTok     time.Time // when the first streamed content arrived
+}
+type usageKey struct{}
+
+func NewHandler(pool *Pool) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) { handleChat(pool, w, r) })
+	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) { handleModels(pool, w) })
+	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) { handleStatus(pool, w) })
+	mux.HandleFunc("GET /policies", func(w http.ResponseWriter, r *http.Request) { handlePolicies(pool, w) })
+	mux.HandleFunc("PUT /v1/policies/default", func(w http.ResponseWriter, r *http.Request) {
+		handleSetDefaultPolicy(pool, w, r)
+	})
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		api.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	return mux
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+	wrote  bool
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	if s.wrote {
+		return
+	}
+	s.status = code
+	s.wrote = true
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	if !s.wrote {
+		s.status = 200
+		s.wrote = true
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
+func handleChat(pool *Pool, w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	rec := &statusRecorder{ResponseWriter: w, status: 200}
+	w = rec
+	requestID := strings.TrimSpace(r.Header.Get("X-Request-ID"))
+	if requestID == "" {
+		requestID = metrics.NewRequestID()
+	}
+	var req api.ChatRequest
+	convID := strings.TrimSpace(r.Header.Get("X-Conversation-ID"))
+	policyName := strings.TrimSpace(r.Header.Get("X-Meridian-Routing-Policy"))
+	workerID := ""
+	est := tokens.Estimate{}
+	usage := &requestUsage{}
+	defer func() {
+		entry := metrics.RequestLog{
+			Timestamp:       time.Now().UTC().Format(time.RFC3339),
+			RequestID:       requestID,
+			Model:           req.Model,
+			WorkerID:        workerID,
+			ConversationID:  convID,
+			StatusCode:      rec.status,
+			LatencyMS:       time.Since(start).Milliseconds(),
+			EstInputTokens:  est.Input,
+			EstOutputTokens: est.Output,
+			EstTotalTokens:  est.Total,
+		}
+		if usage.ok {
+			entry.ActualPromptTokens = usage.in
+			entry.ActualCompletionTokens = usage.out
+		}
+		metrics.AppendRequest(entry)
+	}()
+
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+	if err != nil {
+		api.WriteError(w, 400, "invalid_request", "could not read body (max 1 MiB)")
+		return
+	}
+	if json.Unmarshal(raw, &req) != nil {
+		api.WriteError(w, 400, "invalid_request", "body is not valid JSON")
+		return
+	}
+	if req.Model == "" {
+		api.WriteError(w, 400, "invalid_request", "model is required")
+		return
+	}
+
+	route := routeSize(pool, req, convID)
+	worker, sess, reservation, err := pool.PickForSessionWithRouteReserved(req.Model, convID, policyName, route)
+	if errors.Is(err, ErrUnknownRoutingPolicy) {
+		api.WriteError(w, 400, "unknown_routing_policy", err.Error())
+		return
+	}
+	if errors.Is(err, ErrModelNotFound) {
+		api.WriteError(w, 404, "model_not_found", "unknown model "+strconv.Quote(req.Model))
+		return
+	}
+	if errors.Is(err, ErrNoHealthyWorker) {
+		msg := "no healthy worker for model " + strconv.Quote(req.Model)
+		if pool.ModelStarting(req.Model) {
+			msg = "workers for " + strconv.Quote(req.Model) + " are still starting"
+		}
+		api.WriteError(w, 503, "no_healthy_worker", msg)
+		return
+	}
+	if errors.Is(err, ErrModelMismatch) {
+		api.WriteError(w, 400, "model_mismatch", "conversation is bound to a different model")
+		return
+	}
+	if errors.Is(err, ErrContextTooLong) {
+		api.WriteError(w, 413, "context_too_long", "prompt exceeds the context window of every healthy worker for this model")
+		return
+	}
+	if err != nil {
+		api.WriteError(w, 500, "internal_error", err.Error())
+		return
+	}
+	// Release the reservation if the request fails before proxying.
+	defer reservation.Release()
+	workerID = worker.Spec.ID
+
+	usedPolicy := policyName
+	if usedPolicy == "" {
+		usedPolicy = pool.DefaultRoutingPolicy()
+	}
+
+	upstreamReq := req
+	if convID != "" && sess != nil {
+		sess.mu.Lock()
+		if sess.inFlight {
+			sess.mu.Unlock()
+			api.WriteError(w, 409, "conversation_busy", "conversation is busy")
+			return
+		}
+		sess.inFlight = true
+		sess.LastUsed = time.Now()
+
+		history := make([]api.Message, len(sess.Messages))
+		copy(history, sess.Messages)
+		sess.mu.Unlock()
+
+		defer func() {
+			sess.mu.Lock()
+			sess.inFlight = false
+			sess.LastUsed = time.Now()
+			sess.mu.Unlock()
+		}()
+
+		upstreamReq.Messages = append(history, req.Messages...)
+	}
+
+	est = tokens.ForRequest(upstreamReq)
+
+	if convID != "" && sess != nil {
+		perConvCtx := pool.PerConvContext()
+		if perConvCtx > 0 && (est.Input > perConvCtx || est.Total > perConvCtx) {
+			api.WriteError(w, 413, "context_too_long", "prompt exceeds per-conversation context limit")
+			return
+		}
+
+		upstreamRaw, err := json.Marshal(upstreamReq)
+		if err != nil {
+			api.WriteError(w, 500, "internal_error", "failed to marshal request")
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(upstreamRaw))
+		r.ContentLength = int64(len(upstreamRaw))
+	} else {
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+		r.ContentLength = int64(len(raw))
+	}
+	if req.Stream {
+		body, _ := io.ReadAll(r.Body)
+		body = withStreamUsage(body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
+	}
+
+	queueMs := float64(time.Since(start).Microseconds()) / 1000
+	predictedMs := -1.0
+	if usedPolicy == "token-aware" {
+		predictedMs = PredictMs(worker, route)
+	}
+	w.Header().Set("X-Meridian-Worker", worker.Spec.ID)
+	w.Header().Set("X-Meridian-Model", req.Model)
+	w.Header().Set("X-Meridian-Routing-Policy", usedPolicy)
+	w.Header().Set("X-Meridian-Queue-Ms", strconv.FormatFloat(queueMs, 'f', 1, 64))
+	if predictedMs >= 0 {
+		w.Header().Set("X-Meridian-Predicted-Ms", strconv.FormatFloat(predictedMs, 'f', 1, 64))
+	}
+	w.Header().Set("X-Meridian-Est-Input-Tokens", strconv.Itoa(est.Input))
+	w.Header().Set("X-Meridian-Est-Output-Tokens", strconv.Itoa(est.Output))
+	w.Header().Set("X-Meridian-Est-Total-Tokens", strconv.Itoa(est.Total))
+
+	reservation.Commit()
+	defer worker.InFlight.Add(-1)
+	worker.EstTokensInFlight.Add(int64(est.Total))
+	defer worker.EstTokensInFlight.Add(-int64(est.Total))
+
+	r = r.WithContext(context.WithValue(r.Context(), usageKey{}, usage))
+
+	// Single-retry failover (non-streaming only): if dial/reset fails before headers written,
+	// try once on a different worker.
+	if !req.Stream && rec.status == 0 {
+		worker.Proxy.ServeHTTP(w, r)
+		if rec.status >= 500 && !rec.wrote {
+			// Pre-header failure: try failover
+			log.Printf("worker %s failed pre-headers, attempting failover", worker.Spec.ID)
+			worker.recordFailure(errors.New("failover triggered"))
+
+			// Migrate session if bound to this worker
+			if convID != "" && sess != nil {
+				sess.mu.Lock()
+				oldWorkerID := sess.WorkerID
+				sess.mu.Unlock()
+
+				// Pick new worker
+				newWorker, _, newReservation, err := pool.PickForSessionWithRouteReserved(req.Model, convID, policyName, route)
+				if err == nil && newWorker.Spec.ID != oldWorkerID {
+					sess.mu.Lock()
+					sess.WorkerID = newWorker.Spec.ID
+					sess.mu.Unlock()
+					log.Printf("session %s failover moved %s -> %s", convID, oldWorkerID, newWorker.Spec.ID)
+
+					// Retry: re-buffer body and proxy to new worker
+					if convID != "" && sess != nil {
+						sess.mu.Lock()
+						history := make([]api.Message, len(sess.Messages))
+						copy(history, sess.Messages)
+						sess.mu.Unlock()
+
+						retryReq := req
+						retryReq.Messages = append(history, req.Messages...)
+						retryRaw, _ := json.Marshal(retryReq)
+						r.Body = io.NopCloser(bytes.NewReader(retryRaw))
+						r.ContentLength = int64(len(retryRaw))
+					} else {
+						r.Body = io.NopCloser(bytes.NewReader(raw))
+						r.ContentLength = int64(len(raw))
+					}
+
+					w.Header().Set("X-Meridian-Failover", fmt.Sprintf("%s->%s", worker.Spec.ID, newWorker.Spec.ID))
+					worker = newWorker
+					reservation.Release()
+					reservation = newReservation
+					reservation.Commit()
+
+					// Clear rec for second attempt
+					rec.wrote = false
+					rec.status = 0
+					newWorker.Proxy.ServeHTTP(w, r)
+				} else {
+					newReservation.Release()
+				}
+			}
+		}
+	} else {
+		// Streaming or already wrote headers: no retry
+		worker.Proxy.ServeHTTP(w, r)
+	}
+
+	if rec.status < 500 {
+		worker.Served.Add(1)
+	}
+
+	// Update rolling token/s from actual usage
+	if usage.ok && rec.status == 200 {
+		elapsed := time.Since(start).Seconds()
+		if usage.streamed && !usage.firstTok.IsZero() {
+			// Generation speed: prompt processing happens before the first token.
+			elapsed = time.Since(usage.firstTok).Seconds()
+		}
+		if elapsed > 0.05 {
+			measured := float64(usage.out) / elapsed
+			worker.UpdateSpeed(measured)
+		}
+		pool.recordOutput(req.Model, usage.out)
+	}
+
+	if convID != "" && sess != nil && rec.status == 200 && r.Context().Err() == nil && usage.assistantMsg != nil {
+		sess.mu.Lock()
+		sess.Messages = append(sess.Messages, req.Messages...)
+		sess.Messages = append(sess.Messages, *usage.assistantMsg)
+		sess.mu.Unlock()
+	}
+
+	actIn, actOut := "?", "?"
+	if usage.ok {
+		actIn = strconv.Itoa(usage.in)
+		actOut = strconv.Itoa(usage.out)
+	}
+	log.Printf("model=%s policy=%s worker=%s status=%d time=%dms est_in=%d est_out<=%d act_in=%s act_out=%s", req.Model, usedPolicy, worker.Spec.ID, rec.status, time.Since(start).Milliseconds(), est.Input, est.Output, actIn, actOut)
+}
+
+// routeSize estimates the request's size for size-aware routing. For a
+// conversation, the stored history is part of what the worker will read.
+func routeSize(pool *Pool, req api.ChatRequest, convID string) RouteRequest {
+	msgs := req.Messages
+	if convID != "" {
+		if sess, ok := pool.SessionStore().Get(convID); ok {
+			sess.mu.Lock()
+			msgs = append(append([]api.Message{}, sess.Messages...), req.Messages...)
+			sess.mu.Unlock()
+		}
+	}
+	est := tokens.ForRequest(api.ChatRequest{Messages: msgs, MaxTokens: req.MaxTokens})
+	return RouteRequest{InputTokens: est.Input, OutputTokens: est.Output}
+}
+
+func captureUsage(resp *http.Response, usage *requestUsage) error {
+	if resp.StatusCode == 200 && strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		usage.streamed = true
+		resp.Body = &streamUsageReader{src: resp.Body, usage: usage}
+		return nil
+	}
+	if resp.StatusCode != 200 || !strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
+		return nil
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(raw))
+	resp.ContentLength = int64(len(raw))
+	var result api.ChatResponse
+	if json.Unmarshal(raw, &result) == nil {
+		usage.in = result.Usage.PromptTokens
+		usage.out = result.Usage.CompletionTokens
+		usage.ok = true
+		if len(result.Choices) > 0 {
+			msg := result.Choices[0].Message
+			usage.assistantMsg = &msg
+		}
+	}
+	return nil
+}
+
+func handleModels(pool *Pool, w http.ResponseWriter) {
+	list := api.ModelList{Object: "list", Data: []api.ModelInfo{}}
+	for _, m := range pool.Models() {
+		list.Data = append(list.Data, api.ModelInfo{ID: m, Object: "model"})
+	}
+	api.WriteJSON(w, 200, list)
+}
+func handleStatus(pool *Pool, w http.ResponseWriter) {
+	api.WriteJSON(w, 200, api.StatusResponse{
+		Workers:      pool.Snapshot(),
+		SessionCount: pool.SessionStore().TotalCount(),
+	})
+}
+func handlePolicies(pool *Pool, w http.ResponseWriter) {
+	api.WriteJSON(w, 200, api.RoutingPolicyList{
+		Default:  pool.DefaultRoutingPolicy(),
+		Policies: pool.RoutingPolicies(),
+	})
+}

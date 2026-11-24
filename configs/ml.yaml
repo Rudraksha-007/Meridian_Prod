@@ -1,0 +1,19 @@
+# Meridian LLM serving configuration
+#
+# Run with: ./bin/meridian-server serve --enable-llm=true \
+#       --ml-config ./configs/ml.yaml
+
+listen_host: 127.0.0.1
+
+# protect-llm: OCR workers are admitted only when their declared budgets fit.
+# Meridian never stops or evicts an LLM worker to make room for OCR.
+resource_policy: protect-llm
+
+resources:
+  ram_headroom_mb: 1024
+  vram_headroom_mb: 1024
+  protected_llm_vram_mb: 1024
+  gpu_probe: auto   # auto | off. Unknown VRAM is never treated as unlimited.
+
+# Grace period for draining in-flight requests on shutdown, before SIGTERM.
+shutdown_grace_seconds: 10

@@ -1,0 +1,61 @@
+1. Starting as the Leader
+The command you provided already starts the leader role. It sets up:
+- UDP discovery on port 9999
+- TCP control plane on port 9000
+- HTTP API on port 8080
+- Registry management 
+NOTE : GO must be preinstalled on the host
+
+# Initialize Go module (only needed if go.mod is missing)
+go mod init github.com/dikshaWagh/meridian
+
+# Initialize/go mod tidy (needs network access for the module dependency)
+go mod tidy
+
+# Build the binary
+go build -o meridian-server ./cmd/meridian-server/
+
+Run as Leader: will automatically discovery the 
+Using the already-built binary at /home/rudra/Meridian_Prod/bin/meridian-server:
+
+#key can be changed as well
+#LINUX COMMANDS : 
+export MERIDIAN_CLUSTER_SECRET='xNC1IgeaZUoQlyF7/EGQeiH4U6gH6uiaoGoELJAzb7E='
+
+./bin/meridian-server serve --leader \
+  --advertise-ip 10.59.127.45 \
+  --llm deepseek-r1-1.5b.gguf:2 \
+  --llm qwen2.5-1.5b-instruct-q4_k_m.gguf:2 \
+  --models-dir /home/rudra/meridian/models \
+  --llama-bin /usr/local/lib/ollama/llama-server \
+  --ngl 99 --gpu-workers 2 \
+  --threads 3 --parallel 2 --ctx 4096 \
+  --host 0.0.0.0 --port 8080 \
+  --control-port 9000 --discovery-port 9999 \
+  --replica-port-base 8100 \
+  --ram-headroom-mb 1042
+
+
+RUNNING AS A WORKER : 
+
+Other machines on the LAN should start as workers:
+
+export MERIDIAN_CLUSTER_SECRET='xNC1IgeaZUoQlyF7/EGQeiH4U6gH6uiaoGoELJAzb7E='
+./bin/meridian-server serve --worker \
+  --leader-addr <ADD YOUR LEADER IP ADDRESS HERE> \
+  --advertise-ip <WORKER IP ADDRESS HERE> \
+  --llm deepseek-r1-1.5b.gguf:1 \
+  --models-dir /home/rudra/meridian/models \
+  --llama-bin /usr/local/lib/ollama/llama-server \
+  --ngl 99 --gpu-workers 2 \
+  --threads 3 --parallel 2 --ctx 4096 \
+  --host 0.0.0.0 --port 8081 \
+  --control-port 9000 \
+  --discovery-port 9999 \
+  --replica-port-base 8100 \
+  --ram-headroom-mb 1042
+  
+  
+  
+  
+  on leader open : http://127.0.0.1:8080 to chat with meridian directly or http://<LEADER IP ADDRESS>:8080 on any network connected devices 
