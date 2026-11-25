@@ -1,0 +1,102 @@
+NOTE : GO and Power Shell must be preinstalled on the host
+
+/////////////////////////////llama.cpp MUST be installed on the system///////////
+installation using Winget command : 
+OPEN powershell as a ADMIN.
+run : 
+winget install llama.cpp
+CLOSE POWERSHELL 
+AND REOPEN IT AND RUN :
+where.exe llama-server
+NOW SAVE THIS OUTPUT --------->#0
+/////////////////////////////////////////////////////////////////////////////////
+/////////////OBTAIN YOU IP ADDRESS//////////////////
+run in terminal : ipconfig 
+and save the ouput of IPv4.
+this is <YOUR IP ADDRESS>
+////////////////////////////////////////////////////////////////////////////////
+
+
+# Initialize Go module (only needed if go.mod is missing)
+go mod init github.com/dikshaWagh/meridian
+
+# Initialize/go mod tidy (needs network access for the module dependency)
+go mod tidy
+
+# Build the binary
+go build -o meridian-server.exe ./cmd/meridian-server/
+
+Running as Leader: will automatically discovery the worker nodes on the network 
+if any are discovered and share cluster ID they connect 
+
+Using the already-built binary at /bin/meridian-server:
+#1 : build a new 32 byte (256 bits) cryptographically secure secret key encoded in Base64
+
+Copy and paste this block into a PowerShell window : 
+$bytes = New-Object byte[] 32
+$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+$rng.GetBytes($bytes)
+$secret = [Convert]::ToBase64String($bytes)
+Write-Output $secret
+$rng.Dispose()
+
+-----output shall be a value similar to : BGuIpmgCIAhv0Ho78oPeaJrqzIUfTbsm2Mhd1MtcpnI=
+ 
+
+#2 : Copy this and export this as a evironmental variable 
+
+$env:MERIDIAN_CLUSTER_SECRET= '////PASTE YOUR OUPUT FROM #1 HERE////'
+
+#3 : We also generate a ADMIN Control token 
+
+Repeat Step #1 again in the POWERSHELL
+
+and similarly export a new ADMIN CONTROL TOKEN 
+
+$env:MERIDIAN_ADMIN_TOKEN= '////PASTE YOUR-NEW-OUPUT FROM #1 HERE////'
+
+#4 : start up as a leader :
+
+run : 
+$LLAMA = "<PATH FROM #0>"
+
+aThen :
+.\meridian-server.exe serve --leader `
+  --advertise-ip <YOUR IP ADDRESS> `
+  --llm deepseek-r1-1.5b.gguf:2 `
+  --llm qwen2.5-1.5b-instruct-q4_k_m.gguf:2 `
+  --models-dir "\Meridian_Prod\models" `
+  --llama-bin "$LLAMA" `
+  --ngl 99 --gpu-workers 2 `
+  --threads 3 --parallel 2 --ctx 4096 `
+  --host 0.0.0.0 --port 8080 `
+  --control-port 9000 --discovery-port 9999 `
+  --replica-port-base 8100 `
+  --ram-headroom-mb 1042
+	
+#5 open local host : http://127.0.0.1:8080/
+in your browser 
+
+
+
+
+IN A DIFFERENT COMPUTER ON SAME NETWORK 
+RUNNING AS A WORKER : 
+
+$env:MERIDIAN_CLUSTER_SECRET= '////SAME AS THE LEADER////'
+
+cd C:\WINDOWS\system32\Meridian_Prod
+$LLAMA = (Get-Command llama-server).Source
+.\meridian-server.exe serve --worker `
+  --leader-addr 192.168.1.101 `
+  --advertise-ip 192.168.1.102 `
+  --llm deepseek-r1-1.5b.gguf:1 `
+  --models-dir "C:\WINDOWS\system32\Meridian_Prod\models" `
+  --llama-bin "$LLAMA" `
+  --ngl 99 --gpu-workers 2 `
+  --threads 3 --parallel 2 --ctx 4096 `
+  --host 0.0.0.0 --port 8081 `
+  --control-port 9000 `
+  --discovery-port 9999 `
+  --replica-port-base 8100 `
+  --ram-headroom-mb 1042
